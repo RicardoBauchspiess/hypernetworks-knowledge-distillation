@@ -116,7 +116,7 @@ def train(epoch):
 
 
         outputs, priors = model(inputs)
-        loss = F.cross_entropy(priors, targets, label_smoothing=0.1)
+        loss = criterion(outputs, targets)# F.cross_entropy(priors, targets, label_smoothing=0.1)
 
         if not model.freeze_predictor:
             loss += F.cross_entropy(priors, targets, label_smoothing=0.1)
