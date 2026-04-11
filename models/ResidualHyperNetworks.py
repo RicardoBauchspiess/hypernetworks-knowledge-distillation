@@ -6,6 +6,8 @@ import models.ResNets as ResNet
 from models.ResNets import ResNet20
 from layers.functional import standardize_weight
 
+hyper_weight = 1.0
+
 # =========================
 # Residual HyperConv2d (additive)
 # =========================
@@ -19,8 +21,12 @@ class HyperConv2d(nn.Module):
 
         self.fan_in = (in_c * k * k)
 
+        self.base_weight = nn.Parameter(
+            torch.randn(out_c, in_c, k, k) * (2.0 / (self.fan_in)) ** 0.5
+        )
+
         self.z_dim = z_dim
-        self.delta_weight_head = nn.Linear(z_dim, out_c * in_c * k * k)
+        self.delta_weight_head = nn.Linear(z_dim, out_c * in_c * k * k, bias = False)
 
     def forward(self, x, z):
         B, _, H, W = x.shape
@@ -31,12 +37,27 @@ class HyperConv2d(nn.Module):
         delta_w =  standardize_weight(delta_w, dims = (2,3,4)) # weight standardization (optinal)
         delta_w = delta_w * (2.0 / (self.fan_in)) ** 0.5 # apply keiming normalization
 
+        
+        # apply noise only during training
+        '''
+        if self.training:
+            mask = torch.bernoulli(torch.full_like(delta_w, 0.8))
+            delta_w = delta_w * mask
+            #delta_w = delta_w * (1 + 0.05 * torch.randn_like(delta_w))
+        '''
+        
+        
+        w = self.base_weight.unsqueeze(0)
+        # add static and generated weights
+        w = (w + hyper_weight * delta_w)
+        w = w  / math.sqrt(2) # keep initial variance at 1, or include this in the keiming normalization
+
 
         x = x.view(1, B * self.in_c, H, W)
-        delta_w = delta_w.view(B * self.out_c, self.in_c, self.k, self.k)
+        w = w.view(B * self.out_c, self.in_c, self.k, self.k)
     
 
-        out = F.conv2d(x, delta_w, stride=self.stride, padding=self.k // 2, groups=B)
+        out = F.conv2d(x, w, stride=self.stride, padding=self.k // 2, groups=B)
 
 
         H_out, W_out = out.shape[-2:]
@@ -55,10 +76,13 @@ class HyperLinear(nn.Module):
         self.out_features = out_features
         self.use_bias = bias
 
+        self.base_weight = nn.Parameter(
+            torch.randn(out_features, in_features) * (2.0 / in_features) ** 0.5
+        )
 
         self.fan_in = in_features
 
-        self.delta_weight_head = nn.Linear(z_dim, out_features * in_features)
+        self.delta_weight_head = nn.Linear(z_dim, out_features * in_features, bias = False)
 
         if self.use_bias:
             self.base_bias = nn.Parameter(torch.zeros(out_features))
@@ -75,12 +99,29 @@ class HyperLinear(nn.Module):
         delta_w = standardize_weight(delta_w, dims = 2) # weight standardization (optional)
         delta_w = delta_w * (2.0 / (self.fan_in)) ** 0.5 # kaiming normalization
 
+        # apply noise only during training
+        '''
+        if self.training:
+            mask = torch.bernoulli(torch.full_like(delta_w, 0.8))
+            delta_w = delta_w * mask
+            #delta_w = delta_w * (1 + 0.05 * torch.randn_like(delta_w))
+        '''
+
+        w = self.base_weight.unsqueeze(0)
+        # add static and generated weights
+        w = (w + hyper_weight * delta_w)
+        w = w  / math.sqrt(2) # keep initial variance at 1, or include this in the keiming normalization
+
+
         x = x.unsqueeze(2)
-        out = torch.bmm(delta_w, x).squeeze(2)
+        out = torch.bmm(w, x).squeeze(2)
 
         if self.use_bias:
             delta_b = self.delta_bias_head(z)
-            out = out + delta_b
+            delta_b = delta_b * (2.0 / (self.fan_in)) ** 0.5 # kaiming normalization
+            b = self.base_bias + delta_b
+            b = b / math.sqrt(2)
+            out = out + self.base_bias + delta_b
 
         return out
     
@@ -126,6 +167,8 @@ class HyperTrunk(nn.Module):
         layers = []
         in_dim = z_dim
 
+        self.dropout = nn.Dropout(p=0.5)
+
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.ReLU())
@@ -134,26 +177,20 @@ class HyperTrunk(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, z):
-        return self.net(z)  # h    
+        h = self.net(z)
+        #h = self.dropout(h)
+        return h      
 
 
 # =========================
 # Hybrid ResNet, combining standard conv and residual hyper conv
 # =========================
-class HyperResNet(nn.Module):
-    def __init__(self, num_blocks, num_classes=100, predictor_path = None):
+class ResidualHyperResNet(nn.Module):
+    def __init__(self, num_blocks, num_classes=100, z_dim = 128):
         super().__init__()
 
-        
-        self.predictor = ResNet20(num_classes)
 
-        if predictor_path is not None:
-            state_dict = torch.load(predictor_path, weights_only=True)
-            self.predictor.load_state_dict(state_dict)
-
-        z_dim = 128
         self.hyper_trunk = HyperTrunk(num_classes, hidden_dim = z_dim)
-        
         
         self.in_c = 16
 
@@ -163,20 +200,14 @@ class HyperResNet(nn.Module):
 
         # static early layers
         self.layer1 = self._make_static_layer(16, num_blocks[0], stride=1)
-        self.layer2 = self._make_static_layer(32, num_blocks[1], stride=2)
-        
-        # hyper layers
-        #self.layer2 = self._make_hyper_layer(32, num_blocks[1], z_dim, stride=2)
-        #self.layer3 = self._make_hyper_layer(64, num_blocks[2], z_dim, stride=2)
 
-        self.layer3 = self._make_static_layer(64, num_blocks[2], stride=2)
+        # hyper layers
+        self.layer2 = self._make_hyper_layer(32, num_blocks[1], z_dim, stride=2)
+        self.layer3 = self._make_hyper_layer(64, num_blocks[2], z_dim, stride=2)
 
         # hyper classifier
         self.fc = HyperLinear(64, num_classes, z_dim)
 
-        #self.fc = nn.Linear(64, num_classes)
-
-        self.zero = False
 
     def _make_static_layer(self, out_c, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
@@ -193,48 +224,23 @@ class HyperResNet(nn.Module):
             layers.append(ResBlock(self.in_c, out_c, z_dim, s))
             self.in_c = out_c
         return nn.ModuleList(layers)
-    
-    def predict_hyper(self, x):
 
-        self.predictor.eval()
-        with torch.no_grad():
-            z = self.predictor(x)
-
-            out = self.predictor.get_internal()
+    def forward(self, x, z):
         
-        h = self.hyper_trunk(z)
-
-        return h, out
-    
-    def set_to_zero(self, zero = False):
-        self.zero = zero
-
-    def forward(self, x):
-        
-        z, out = self.predict_hyper(x)
-
-        if self.zero:
-            x = torch.zeros_like(x)
-            
+        z = self.hyper_trunk(z)
         
         out = self.conv1(x)
         out = self.norm1(out)
         out = F.relu(out)
 
         out = self.layer1(out)
-        #out = self.layer2(out)
-        
 
-        '''
-        for block in self.layer1:
-            out = block(out, z)
-        '''
         for block in self.layer2:
             out = block(out, z)
-        
+
         for block in self.layer3:
             out = block(out, z)
-        
+
         out = F.adaptive_avg_pool2d(out, 1)
         out = out.view(out.size(0), -1)       # [B, C]
         out = self.fc(out, z)  
@@ -242,9 +248,69 @@ class HyperResNet(nn.Module):
         return out
     
 
+# =========================
+# Hybrid ResNet, combining standard conv and residual hyper conv
+# =========================
+class PredictorHyperNet(nn.Module):
+    def __init__(self, num_blocks, num_classes=100, predictor_path = None, z_dim = 128):
+        super().__init__()
+
+        self.prior_dim = num_classes
+
+        self.predictor = ResNet20(num_classes)
+
+        if predictor_path is not None:
+            state_dict = torch.load(predictor_path, weights_only=True)
+            self.predictor.load_state_dict(state_dict)
+            self.freeze_predictor = True # don't train the predictor
+        else:
+            self.freeze_predictor = False
+
+        self.hypernet = ResidualHyperResNet(num_blocks, num_classes, z_dim = z_dim)
+
+        self.zero = False
+        self.no_prior = False
+
+    def set_to_zero(self, zero = False):
+        self.zero = zero
+        if self.zero:
+            self.no_prior = False
+
+    def set_no_prior(self, no_prior = False):
+        self.no_prior = no_prior
+        if self.no_prior:
+            self.zero = False     
+
+    def forward(self, x):
+        
+        # test prior impact
+        if self.no_prior:
+            prior = torch.zeros(x.size(0), self.prior_dim, device=x.device)
+            prior_hyper = prior.detach()
+        elif self.freeze_predictor:
+            with torch.no_grad():
+                prior = self.predictor(x)
+            # soften prediction if a pre-trained model is used, to avoid bypass
+            T = 1.6
+            prior_hyper = F.softmax(prior.detach() / T, dim=1)
+            alpha = 0.03
+            prior_hyper = (1 - alpha) * prior_hyper + alpha / self.prior_dim
+        else:
+            prior = self.predictor(x)
+            prior_hyper = prior.detach()
+
+        # test prior bypassing (no image x, uses only prior)
+        if self.zero:
+            x = torch.zeros_like(x)
+        
+        out = self.hypernet(x, prior_hyper)
+
+        return out, prior
+    
+
 
 # =========================
 # ResNet20 factory
 # =========================
-def HyperResNet20(num_classes=100, predictor_path = None):
-    return HyperResNet( [3, 3, 3], num_classes, predictor_path)
+def ResidualHyperResNet20(num_classes=100, predictor_path = None):
+    return PredictorHyperNet( [3, 3, 3], num_classes, predictor_path = predictor_path)

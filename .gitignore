@@ -1,0 +1,16 @@
+# CIFAR datasets
+data/
+data/cifar-10-batches-py/
+data/cifar-100-python/
+
+# checkpoints
+*.pth
+*.pt
+
+# logs
+logs/
+runs/
+
+# cache
+__pycache__/
+*.pyc

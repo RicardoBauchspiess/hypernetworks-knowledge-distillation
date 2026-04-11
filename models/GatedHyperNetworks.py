@@ -6,6 +6,7 @@ import models.ResNets as ResNet
 from models.ResNets import ResNet20
 from layers.functional import standardize_weight
 
+
 # =========================
 # Residual HyperConv2d (additive)
 # =========================
@@ -19,28 +20,59 @@ class HyperConv2d(nn.Module):
 
         self.fan_in = (in_c * k * k)
 
+        self.base_weight = nn.Parameter(
+            torch.randn(out_c, in_c, k, k) * (2.0 / (self.fan_in)) ** 0.5
+        )
+
         self.z_dim = z_dim
         self.delta_weight_head = nn.Linear(z_dim, out_c * in_c * k * k)
+
+        self.gate_head = nn.Linear(z_dim, out_c)
+
+        self.gate_head.bias.data.fill_(-5.0)
 
     def forward(self, x, z):
         B, _, H, W = x.shape
 
+        # splits base and hyperconv, to avoid memory overhead
 
+        # -------- base conv --------
+        out_base = F.conv2d(
+            x,
+            self.base_weight,
+            stride=self.stride,
+            padding=self.k // 2
+        )  # [B, out_c, H, W]
+
+        # -------- hyper conv --------
         delta_w = self.delta_weight_head(z)
         delta_w = delta_w.view(B, self.out_c, self.in_c, self.k, self.k)
+
+        # scaling
         delta_w =  standardize_weight(delta_w, dims = (2,3,4)) # weight standardization (optinal)
-        delta_w = delta_w * (2.0 / (self.fan_in)) ** 0.5 # apply keiming normalization
+        fan_in = self.in_c * self.k * self.k
+        delta_w = delta_w * (2.0 / fan_in) ** 0.5 # kaiming fan_in scaling
 
-
-        x = x.view(1, B * self.in_c, H, W)
+        # grouped conv trick (same as before)
+        x_grouped = x.view(1, B * self.in_c, H, W)
         delta_w = delta_w.view(B * self.out_c, self.in_c, self.k, self.k)
-    
 
-        out = F.conv2d(x, delta_w, stride=self.stride, padding=self.k // 2, groups=B)
+        out_delta = F.conv2d(
+            x_grouped,
+            delta_w,
+            stride=self.stride,
+            padding=self.k // 2,
+            groups=B
+        )
 
+        H_out, W_out = out_delta.shape[-2:]
+        out_delta = out_delta.view(B, self.out_c, H_out, W_out)
 
-        H_out, W_out = out.shape[-2:]
-        out = out.view(B, self.out_c, H_out, W_out)
+        # -------- gating --------
+        g = torch.sigmoid(self.gate_head(z))  # [B, out_c]
+        g = g.view(B, self.out_c, 1, 1)
+
+        out = (1 - g) * out_base + g * out_delta
 
         return out
     
@@ -55,11 +87,19 @@ class HyperLinear(nn.Module):
         self.out_features = out_features
         self.use_bias = bias
 
+        self.base_weight = nn.Parameter(
+            torch.randn(out_features, in_features) * (2.0 / in_features) ** 0.5
+        )
 
         self.fan_in = in_features
 
         self.delta_weight_head = nn.Linear(z_dim, out_features * in_features)
 
+        
+        self.gate_head = nn.Linear(z_dim, out_features)
+
+        self.gate_head.bias.data.fill_(-5.0)
+        
         if self.use_bias:
             self.base_bias = nn.Parameter(torch.zeros(out_features))
             self.delta_bias_head = nn.Linear(z_dim, out_features)
@@ -70,17 +110,29 @@ class HyperLinear(nn.Module):
     def forward(self, x, z):
         B = x.size(0)
 
+        # -------- base path --------
+        out_base = F.linear(x, self.base_weight)  # [B, out]
+
+        # -------- hyper path --------
         delta_w = self.delta_weight_head(z)
         delta_w = delta_w.view(B, self.out_features, self.in_features)
-        delta_w = standardize_weight(delta_w, dims = 2) # weight standardization (optional)
-        delta_w = delta_w * (2.0 / (self.fan_in)) ** 0.5 # kaiming normalization
 
-        x = x.unsqueeze(2)
-        out = torch.bmm(delta_w, x).squeeze(2)
+        # scaling
+        delta_w = standardize_weight(delta_w, dims = 2) # weight standardization (optional)
+        delta_w = delta_w * (2.0 / self.in_features) ** 0.5 # keiming fan_in scaling
+
+        # batched matmul
+        x_exp = x.unsqueeze(2)  # [B, in, 1]
+        out_delta = torch.bmm(delta_w, x_exp).squeeze(2)  # [B, out]
+
+        # -------- gating --------
+        g = torch.sigmoid(self.gate_head(z))  # [B, out]
+
+        out = (1 - g) * out_base + g * out_delta
 
         if self.use_bias:
             delta_b = self.delta_bias_head(z)
-            out = out + delta_b
+            out = out + self.base_bias + delta_b
 
         return out
     
@@ -126,6 +178,8 @@ class HyperTrunk(nn.Module):
         layers = []
         in_dim = z_dim
 
+        self.dropout = nn.Dropout(p=0.5)
+
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.ReLU())
@@ -134,13 +188,15 @@ class HyperTrunk(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, z):
-        return self.net(z)  # h    
+        h = self.net(z)
+        h = self.dropout(h)
+        return h    
 
 
 # =========================
 # Hybrid ResNet, combining standard conv and residual hyper conv
 # =========================
-class HyperResNet(nn.Module):
+class GatedHyperResNet(nn.Module):
     def __init__(self, num_blocks, num_classes=100, predictor_path = None):
         super().__init__()
 
@@ -163,18 +219,13 @@ class HyperResNet(nn.Module):
 
         # static early layers
         self.layer1 = self._make_static_layer(16, num_blocks[0], stride=1)
-        self.layer2 = self._make_static_layer(32, num_blocks[1], stride=2)
-        
-        # hyper layers
-        #self.layer2 = self._make_hyper_layer(32, num_blocks[1], z_dim, stride=2)
-        #self.layer3 = self._make_hyper_layer(64, num_blocks[2], z_dim, stride=2)
 
-        self.layer3 = self._make_static_layer(64, num_blocks[2], stride=2)
+        # hyper layers
+        self.layer2 = self._make_hyper_layer(32, num_blocks[1], z_dim, stride=2)
+        self.layer3 = self._make_hyper_layer(64, num_blocks[2], z_dim, stride=2)
 
         # hyper classifier
         self.fc = HyperLinear(64, num_classes, z_dim)
-
-        #self.fc = nn.Linear(64, num_classes)
 
         self.zero = False
 
@@ -212,29 +263,22 @@ class HyperResNet(nn.Module):
     def forward(self, x):
         
         z, out = self.predict_hyper(x)
-
+        
         if self.zero:
             x = torch.zeros_like(x)
-            
         
         out = self.conv1(x)
         out = self.norm1(out)
         out = F.relu(out)
 
         out = self.layer1(out)
-        #out = self.layer2(out)
-        
 
-        '''
-        for block in self.layer1:
-            out = block(out, z)
-        '''
         for block in self.layer2:
             out = block(out, z)
-        
+
         for block in self.layer3:
             out = block(out, z)
-        
+
         out = F.adaptive_avg_pool2d(out, 1)
         out = out.view(out.size(0), -1)       # [B, C]
         out = self.fc(out, z)  
@@ -246,5 +290,5 @@ class HyperResNet(nn.Module):
 # =========================
 # ResNet20 factory
 # =========================
-def HyperResNet20(num_classes=100, predictor_path = None):
-    return HyperResNet( [3, 3, 3], num_classes, predictor_path)
+def GatedHyperResNet20(num_classes=100, predictor_path = None):
+    return GatedHyperResNet( [3, 3, 3], num_classes, predictor_path)

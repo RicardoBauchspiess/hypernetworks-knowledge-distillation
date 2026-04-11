@@ -65,12 +65,16 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
+    def get_internal(self,):
+        return self.internal_output
     def forward(self, x):
         out = self.conv1(x)
         out = self.norm1(out)
         out = F.relu(out)
 
         out = self.layer1(out)
+
+        self.internal_output = out.clone().detach()
         out = self.layer2(out)
         out = self.layer3(out)
 
