@@ -94,7 +94,7 @@ We investigate several approaches to mitigate shortcut learning:
 - **Prediction softening (temperature scaling / smoothing):**  
   Softening the predictor outputs (e.g., via temperature-scaled softmax) reduces shortcut reliance and improves performance. However, this approach is sensitive to hyperparameters and requires careful tuning.
 
-Previous approaches were effective for models using GroupNorm. However when switching to BatchNorm, those approaches weren't enough, given the per-sample nature of hyper layers. 
+Previous approaches were effective for models using GroupNorm. However when switching to BatchNorm, those approaches weren't enough, given the per-sample nature of hyper layers. Additional strategies are being tested for this more challenging scenario, with various levels of effectiveness:
 
 - **Custom Loss Function:**
   Give hypernet greater focus to samples in which the prior has worse performance
