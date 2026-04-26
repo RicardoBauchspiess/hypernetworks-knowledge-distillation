@@ -55,6 +55,8 @@ class ResNet(nn.Module):
 
         self.fc = nn.Linear(64, num_classes)
 
+        self.dropout_rate = 0.2
+
     def _make_layer(self, block, out_c, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
@@ -67,7 +69,11 @@ class ResNet(nn.Module):
 
     def get_internal(self,):
         return self.internal_output
-    def forward(self, x):
+    def forward(self, x, dropout = None):
+
+        if dropout is None:
+            dropout = self.dropout_rate
+
         out = self.conv1(x)
         out = self.norm1(out)
         out = F.relu(out)
@@ -80,6 +86,7 @@ class ResNet(nn.Module):
 
         out = F.adaptive_avg_pool2d(out, 1)
         out = out.view(out.size(0), -1)
+        out = F.dropout(out, p=dropout, training=self.training)
         out = self.fc(out)
 
         return out

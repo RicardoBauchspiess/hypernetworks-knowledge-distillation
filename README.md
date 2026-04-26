@@ -90,14 +90,20 @@ We investigate several approaches to mitigate shortcut learning:
 - Regularization (dropout, noise injection in \( z \))  
 - Restricting hypernetworks to later layers  
 - **Joint training of predictor and hypernetwork:**  
-  Training both components simultaneously yields the most stable behavior. In this regime, the predictor introduces weaker signals early in training, encouraging reliance on image features. Empirically, this results in:
-  - Low accuracy when `x = 0`  
-  - Significant accuracy drop when `z = 0` (≈ halved in most epochs)
-  - The hypernetwork model significantly outperforming the standalone predictor 
+  Training both components simultaneously yields the most stable behavior. In this regime, the predictor introduces weaker signals early in training, encouraging reliance on image features.
 - **Prediction softening (temperature scaling / smoothing):**  
   Softening the predictor outputs (e.g., via temperature-scaled softmax) reduces shortcut reliance and improves performance. However, this approach is sensitive to hyperparameters and requires careful tuning.
 
-📄 See **`docs/shortcut_learning.md`** for full experiments and analysis.
+Previous approaches were effective for models using GroupNorm. However when switching to BatchNorm, those approaches weren't enough, given the per-sample nature of hyper layers. 
+
+- **Custom Loss Function:**
+  Give hypernet greater focus to samples in which the prior has worse performance
+- **Custom Data augmentation:**
+  Generates disagreement between prior and hypernet, making the later not fully trust predictor.
+- **Training schedulinng:**
+  Gives prior an early disadvantage, making it less attractive for bypassing.
+- **Weight initialization:**
+  Makes the model focus more on input than conditioning during early epochs.
 
 ---
 

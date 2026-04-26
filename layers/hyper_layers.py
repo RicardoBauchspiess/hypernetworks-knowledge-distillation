@@ -2,39 +2,71 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import warnings
-
 from layers.functional import hyper_conv2d
-# =========================================================
-# OPERATORS
-# =========================================================
 
-class FullOp(nn.Module):
-    def __init__(self, in_c, out_c, k, z_dim, groups=1):
+class HyperConv2d(nn.Module):
+    """
+    Hypernetwork-based 2D convolution.
+
+    Generates convolution weights from a conditioning vector `z`
+    and applies them dynamically to the input.
+
+    Supports grouped conv and optional low-rank projection.
+    """
+    def __init__(
+        self,
+        in_c,
+        out_c,
+        k,
+        z_dim,
+        stride=1,
+        groups=1,
+        rank=None,
+        compression=None,
+        **kwargs  # allows future extension without breaking
+    ):
         super().__init__()
 
-        assert in_c % groups == 0
-        assert out_c % groups == 0
+        assert in_c % groups == 0, "in_c must be divisible by groups"
+        assert out_c % groups == 0, "out_c must be divisible by groups"
 
         self.in_c = in_c
         self.out_c = out_c
         self.k = k
         self.groups = groups
+        self.stride = stride
 
         self.in_per_group = in_c // groups
         self.out_per_group = out_c // groups
 
-        self.linear = nn.Linear(
-            z_dim,
-            groups * self.out_per_group * self.in_per_group * k * k,
-            bias=False
+        layers = []
+
+        # Rank based on compression
+        if rank is None and compression is not None:
+            rank = z_dim // compression
+
+        # Low-rank projection (LoRA-style)
+        if rank is not None:
+            layers.append(nn.Linear(z_dim, rank, bias=False))
+            z_dim = rank
+
+        # Final projection to conv weights
+        layers.append(
+            nn.Linear(
+                z_dim,
+                groups * self.out_per_group * self.in_per_group * k * k,
+                bias=False
+            )
         )
+
+        self.layers = nn.Sequential(*layers)
 
     # =====================================================
     def get_weight(self, z):
         B = z.size(0)
 
-        W = self.linear(z).view(
+        # Generate weights from conditioning vector
+        w = self.layers(z).view(
             B,
             self.groups,
             self.out_per_group,
@@ -43,8 +75,11 @@ class FullOp(nn.Module):
             self.k
         )
 
-        # reshape to grouped conv format
-        return W.view(
+        # Kaiming fan-in normalization
+        w = w * ((2.0) / (self.k * self.k * self.in_per_group)) ** 0.5
+
+        # Reshape to grouped conv format
+        return w.view(
             B,
             self.out_c,
             self.in_per_group,
@@ -54,310 +89,298 @@ class FullOp(nn.Module):
 
     # =====================================================
     def forward(self, x, z):
-        from layers.functional import hyper_conv2d
-        W = self.get_weight(z)
-        return hyper_conv2d(x, W, groups=self.groups)
+        # Get conditioned convolution weights
+        w = self.get_weight(z)
 
-
-class PWOp(nn.Module):
-    def __init__(self, in_c, out_c, z_dim, groups=1):
-        super().__init__()
-
-        assert in_c % groups == 0
-        assert out_c % groups == 0
-
-        self.in_c = in_c
-        self.out_c = out_c
-        self.groups = groups
-
-        self.in_per_group = in_c // groups
-        self.out_per_group = out_c // groups
-
-        # one linear that outputs all groups
-        self.linear = nn.Linear(
-            z_dim,
-            groups * self.out_per_group * self.in_per_group,
-            bias=False
-        )
-
-    # =====================================================
-    def forward(self, x, z):
-        B, _, H, W = x.shape
-
-        pw = self.linear(z).view(
-            B,
-            self.groups,
-            self.out_per_group,
-            self.in_per_group
-        )
-
-        # reshape x into groups
-        x = x.view(B, self.groups, self.in_per_group, H, W)
-
-        # einsum per group
-        out = torch.einsum(
-            "bgchw, bgoc -> bgo hw",
+        # Apply convolution
+        out = hyper_conv2d(
             x,
-            pw
+            w,
+            stride=self.stride,
+            groups=self.groups
         )
 
-        return out.reshape(B, self.out_c, H, W)
-
-    # =====================================================
-    def get_weight(self, z):
-        B = z.size(0)
-
-        pw = self.linear(z).view(
-            B,
-            self.groups,
-            self.out_per_group,
-            self.in_per_group
-        )
-
-        w = torch.zeros(
-            B,
-            self.groups,
-            self.out_per_group,
-            self.groups,
-            self.in_per_group,
-            1,
-            1,
-            device=z.device,
-            dtype=z.dtype
-        )
-
-        # fill diagonal blocks
-        idx = torch.arange(self.groups)
-        w[:, idx, :, idx, :, 0, 0] = pw
-
-        return w.view(B, self.out_c, self.in_c, 1, 1)
-
-
-class DWOp(nn.Module):
-    def __init__(self, out_c, k, z_dim):
-        super().__init__()
-        self.out_c = out_c
-        self.k = k
-        self.linear = nn.Linear(z_dim, out_c * k * k, bias=False)
-
-    def forward(self, x, z, stride=1, padding=None):
-        B, C, H, W = x.shape
-
-        if padding is None:
-            padding = self.k // 2
-
-        W_dw = self.linear(z).view(B, self.out_c, 1, self.k, self.k)
-
-        out =  hyper_conv2d(
-                    x,
-                    W_dw,
-                    stride=stride,
-                    padding=padding,
-                    groups=self.out_c,  
-                )
         return out
+    
+class DecomposedHyperConv2d(nn.Module):
+    """
+    Decomposed Hyper Convolutional Layer
+    Generates a full kernel via pointwise (channel mixing)
+    and depthwise (spatial structure) components.
 
-    def get_weight(self, z):
-        B = z.size(0)
-        return self.linear(z).view(B, self.out_c, 1, self.k, self.k)
+    """
 
-
-class BaseOp(nn.Module):
-    def __init__(self, in_c, out_c, k, z_dim, use_gate, groups=1):
-        super().__init__()
-
-        assert in_c % groups == 0
-        assert out_c % groups == 0
-
-        self.in_c = in_c
-        self.out_c = out_c
-        self.k = k
-        self.groups = groups
-        self.use_gate = use_gate
-
-        self.in_per_group = in_c // groups
-
-        self.weight = nn.Parameter(
-            torch.randn(out_c, self.in_per_group, k, k) *
-            (2 / (self.in_per_group * k * k))**0.5
-        )
-
-        self.gate = nn.Linear(z_dim, out_c, bias=False) if use_gate else None
-
-    def get_weight(self, z):
-        B = z.size(0)
-
-        W = self.weight.unsqueeze(0)
-
-        if self.use_gate:
-            gate = self.gate(z).view(B, self.out_c, 1, 1, 1)
-            W = W * gate
-        else:
-            W = W.expand(B, -1, -1, -1, -1)
-
-        return W
-
-
-# =========================================================
-# MAIN MODULE
-# =========================================================
-
-class HyperConv2d(nn.Module):
     def __init__(
         self,
         in_c,
         out_c,
         k,
         z_dim,
-        groups = 1,
-        stride=1, 
-        padding=None,
-        use_base=True,
-        use_gate=True,
-        use_pw=True,
-        use_dw=True,
-        use_full = False,
+        stride=1,
+        groups=1,
+        rank=None,
+        compression=None,
+        **kwargs,  # <-- important for compatibility
     ):
         super().__init__()
 
-        self.use_base = use_base
-        self.use_pw = use_pw
-        self.use_dw = use_dw and k > 1
-        self.use_full = use_full
+        self.in_c = in_c
+        self.out_c = out_c
+        self.k = k
         self.stride = stride
-        self.padding = padding if padding is not None else k // 2
+        self.groups = groups
 
+        # Pointwise: channel mixing
+        self.pw = HyperConv2d(
+            in_c=in_c,
+            out_c=out_c,
+            k=1, # pointwise
+            z_dim=z_dim,
+            groups=groups,
+            rank=rank,
+            compression=compression,
+        )
+
+        # Depthwise: spatial structure
+        self.dw = HyperConv2d(
+            in_c=out_c,
+            out_c=out_c,
+            k=k,
+            z_dim=z_dim,
+            stride=stride,
+            groups=out_c,  # depthwise
+            rank=rank,
+            compression=compression,
+        )
+
+    # =====================================================
+    def get_weight(self, z):
+        """
+        Combines pointwise and depthwise into a single kernel
+        to be used by other modules
+
+        Equivalent to:
+            W[o, i, :, :] = pw[o, i] * dw[o, :, :]
+        """
         
 
-        # ---- depthwise constraint ----
-        is_depthwise = (groups == in_c)
+        # (B, out_c, in_c, 1, 1)
+        pw = self.pw.get_weight(z)
 
-        if is_depthwise:
-            if use_pw or use_dw:
-                if not use_full:
-                    warnings.warn(
-                        "Depthwise mode (groups == in_c) does not support pw/dw. "
-                        "Switching to use_full=True."
-                    )
+        # (B, out_c, 1, k, k)
+        dw = self.dw.get_weight(z)
 
-                # force full
-                use_full = True
-                self.use_pw = False
-                self.use_dw = False
+        # Merge into full kernel
+        # (B, out_c, in_c, k, k)
+        w = pw * dw
 
-        # operators
-        if use_full:
-            # regular conv hyper weights
-            self.full = FullOp(in_c, out_c, k, z_dim, groups)
-            self.pw = None
-            self.dw = None
-        else:
-            # hyper conv decomposition
-            self.full = None
-            self.pw = PWOp(in_c, out_c, z_dim, groups) if use_pw else None
-            self.dw = DWOp(out_c, k, z_dim) if self.use_dw else None
-
-        # regular conv static (learnable) weights
-        self.base = BaseOp(
-        in_c, out_c, k, z_dim, use_gate, groups) if use_base else None
-
+        return w
 
     # =====================================================
-    # SEQUENTIAL
+    def forward(self, x, z, iter=None):
+        # Sequential application (used in normal forward)
+        out = self.pw(x, z, iter=iter)
+        out = self.dw(out, z, iter=iter)
+        return out
+    
+class HyperModulatedConv2d(nn.Module):
+    """
+    Convolution with channel-wise modulation from a conditioning vector z.
+
+    Two modes:
+    - forward(): fast path (conv + output modulation)
+    - get_weight(): returns sample-wise modulated weights for composition
+    """
+
+    def __init__(
+        self,
+        in_c,
+        out_c,
+        k,
+        z_dim,
+        stride=1,
+        groups=1,
+        rank=None,
+        compression=None,
+        modulate=True,
+        **kwargs
+    ):
+        super().__init__()
+
+        assert in_c % groups == 0
+        assert out_c % groups == 0
+
+        self.in_c = in_c
+        self.out_c = out_c
+        self.k = k
+        self.groups = groups
+        self.stride = stride
+        self.modulate = modulate
+
+        self.in_per_group = in_c // groups
+
+        # Base convolution weight
+        self.weight = nn.Parameter(
+            torch.randn(out_c, self.in_per_group, k, k) *
+            (2 / (self.in_per_group * k * k)) ** 0.5
+        )
+
+        # Modulation gate
+        if self.modulate:
+            layers = []
+
+            if rank is None and compression is not None:
+                rank = max(1, z_dim // compression)
+
+            if rank is not None:
+                layers.append(nn.Linear(z_dim, rank, bias=False))
+                z_dim = rank
+
+            layers.append(nn.Linear(z_dim, out_c, bias=True))
+
+            self.gate = nn.Sequential(*layers)
+
     # =====================================================
-    def _forward_sequential(self, x, z):
-        out = None
+    def get_gate(self, z):
+        """
+        Returns channel-wise gate:
+            (B, out_c)
+        """
+        return torch.sigmoid(self.gate(z))
 
-        # ---- base ----
-        if self.base is not None:
-            W_base = self.base.get_weight(z)
-            out = hyper_conv2d(
-                x,
-                W_base,
-                stride=self.stride,
-                padding=self.padding,
-                groups=self.groups,
-            )
+    # =====================================================
+    def get_weight(self, z):
+        """
+        Returns modulated weights:
+            (B, out_c, in_c/groups, k, k)
+        """
+        w = self.weight.unsqueeze(0)  # (1, out_c, in_c/groups, k, k)
 
-        # ---- delta ----
-        if self.full is not None:
-            x_delta = self.full(x, z)
-            out = x_delta if out is None else out + x_delta
+        if self.modulate:
+            g = self.get_gate(z).view(z.size(0), self.out_c, 1, 1, 1)
+            w = w * g
 
-        elif self.pw is not None:
-            x_delta = self.pw(x, z)
+        return w
 
-            if self.dw is not None:
-                x_delta = self.dw(
-                    x_delta,
-                    z,
-                    stride=self.stride,
-                    padding=self.padding,
-                )
+    # =====================================================
+    def forward(self, x, z, iter=None):
+        """
+        Fast path: standard conv + output modulation
+        """
+        out = F.conv2d(
+            x,
+            self.weight,
+            stride=self.stride,
+            padding=self.k // 2,
+            groups=self.groups
+        )
 
-            out = x_delta if out is None else out + x_delta
-
-        elif self.dw is not None:
-            if out is None:
-                raise ValueError("dw requires base or pw")
-
-            x_delta = self.dw(
-                out,
-                z,
-                stride=self.stride,
-                padding=self.padding,
-            )
-
-            # matches merged: base + base*dw
-            out = out + x_delta
+        if self.modulate:
+            g = self.get_gate(z).view(x.size(0), self.out_c, 1, 1)
+            out = out * g
 
         return out
 
-    # =====================================================
-    # MERGED
-    # =====================================================
-    def _forward_merged(self, x, z):
-        w = None
+class ResidualHyperConv2d(nn.Module):
+    """
+    Residual Hyper Convolution.
 
-        # ---- base ----
-        if self.base is not None:
-            w = self.base.get_weight(z)
+    Combines:
+        - Base weight (optionally modulated): Wb
+        - Conditional hyper weight: Wz
 
-        # ---- delta ----
-        if self.full is not None:
-            delta = self.full.get_weight(z)
-        elif self.pw is not None:
-            pw_w = self.pw.get_weight(z)
-            delta = pw_w
-            if self.dw is not None:
-                dw_w = self.dw.get_weight(z)
-                delta = delta * dw_w
+    Final kernel:
+        W = (Wb + Wz) / sqrt(2)
 
-        elif self.dw is not None:
-            if self.base is None:
-                raise ValueError("dw requires base or pw")
-            dw_w = self.dw.get_weight(z)
-            base_w = w
-            delta = base_w * dw_w
-            w = None# base_w was already used (no need to add w to delta w)
-        else:
-            delta = None
+    Supports:
+        - Full hyperconv (Wz)
+        - Decomposed hyperconv (Wz)
+        - Modulated base conv (Wb)
+    """
 
-        if delta is not None:
-            w = delta if w is None else w + delta
+    def __init__(
+        self,
+        in_c,
+        out_c,
+        k,
+        z_dim,
+        stride=1,
+        groups=1,
+        rank=None,
+        compression=None,
+        modulate=True,
+        decompose=True,
+        **kwargs
+    ):
+        super().__init__()
 
-        if w is None:
-            raise ValueError("No active paths")
+        self.stride = stride
+        self.groups = groups
 
-        out =  hyper_conv2d(
-                x,
-                w,
-                stride=self.stride,
-                padding=self.padding,
-                groups=self.groups,
+        # Conditional path (Wz)
+        if decompose:
+            self.Wz = DecomposedHyperConv2d(
+                in_c=in_c,
+                out_c=out_c,
+                k=k,
+                z_dim=z_dim,
+                stride=stride,
+                groups=groups,
+                rank=rank,
+                compression=compression,
             )
-        return out
+        else:
+            self.Wz = HyperConv2d(
+                in_c=in_c,
+                out_c=out_c,
+                k=k,
+                z_dim=z_dim,
+                stride=stride,
+                groups=groups,
+                rank=rank,
+                compression=compression,
+            )
+
+        # Base path (Wb)
+        self.Wb = HyperModulatedConv2d(
+            in_c=in_c,
+            out_c=out_c,
+            k=k,
+            z_dim=z_dim,
+            stride=stride,
+            groups=groups,
+            modulate=modulate,
+            rank=rank,
+            compression=compression,
+        )
 
     # =====================================================
-    def forward(self, x, z, merge=True):
-        return self._forward_merged(x, z) if merge else self._forward_sequential(x, z)
+    def get_weight(self, z):
+        """
+        Returns combined kernel:
+            (B, out_c, in_c/groups, k, k)
+        """
+
+        wb = self.Wb.get_weight(z)  # base (modulated optional)
+        wz = self.Wz.get_weight(z)  # conditional
+
+        # Residual combination (variance-preserving)
+        w = (wz + wb) / (2 ** 0.5)
+
+        return w
+
+    # =====================================================
+    def forward(self, x, z, iter=None):
+        """
+        Always uses merged weight path.
+        """
+        w = self.get_weight(z)
+
+        out = hyper_conv2d(
+            x,
+            w,
+            stride=self.stride,
+            groups=self.groups
+        )
+
+        return out

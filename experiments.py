@@ -15,10 +15,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
 # import models
-from models.ResNets import ResNet20
-from models.HyperNetworks import HyperResNet20
-from models.ResidualHyperNetworks import ResidualHyperResNet20
-from models.GatedHyperNetworks import GatedHyperResNet20
+from models.PredictorHyperNet import PredictorHyperNet
 
 # =========================
 # Config
@@ -57,8 +54,7 @@ testloader = DataLoader(testset, batch_size=256,
                         shuffle=False, num_workers=4)
 
 
-#model = ResidualHyperResNet20(predictor_path = 'saved_models/model_weights.pth').to(DEVICE)
-model = ResidualHyperResNet20().to(DEVICE)
+model = PredictorHyperNet().to(DEVICE)
 
 # =========================
 # Loss & Optimizer
@@ -170,19 +166,21 @@ if __name__ == "__main__":
     for epoch in range(1, EPOCHS + 1):
 
         # train and test with full data
-        model.set_to_zero(False)
-        model.set_no_prior(False)
+        model.zero_input = False
+        model.no_prior = False
         train(epoch)
         test()
 
         # testing hypernetwork bypass
         
-        model.set_to_zero(True) # set image to 0
+        model.zero_input = True # set image to 0
+        model.no_prior = False 
         test()
-        model.set_no_prior(True) # set prior prediction to 0
+        model.zero_input = False
+        model.no_prior = True # set prior prediction to 0
         test()
         
 
         scheduler.step()
 
-    torch.save(model.state_dict(), 'saved_models/full_hyper_model_weights.pth')
+    torch.save(model.state_dict(), 'saved_models/predictorhypernet_weights.pth')
