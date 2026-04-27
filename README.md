@@ -104,6 +104,8 @@ Previous approaches were effective for models using GroupNorm. However when swit
   Gives prior an early disadvantage, making it less attractive for bypassing.
 - **Weight initialization:**
   Makes the model focus more on input than conditioning during early epochs.
+- **LoRA style low rank adaptation:**
+  Low Rank used to avoid easy bypass.
 
 ---
 

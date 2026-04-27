@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import layers.hyper_layers as hl
 import layers.hyper_blocks as hb
 import layers.utils as utils
-from configs.hypernetwork_config import *
+from configs.model.hypernetwork_config import *
 
 
 class HyperNet(nn.Module):
