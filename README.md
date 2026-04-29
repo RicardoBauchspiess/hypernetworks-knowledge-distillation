@@ -40,7 +40,7 @@ We compare several architectures to study the impact of conditional weight gener
 
 ---
 
-These variants allow us to analyze trade-offs between **stability**, **expressiveness**, and **conditional adaptation**.
+These variants allow us to analyze trade-offs between **stability**, **expressiveness**, and **conditional adaptation**. The type used can be defined in configs/models
 
 ---
 

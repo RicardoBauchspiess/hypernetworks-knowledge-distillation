@@ -22,7 +22,8 @@ if __name__ == "__main__":
     optimizer["hypernet"] = build_optimizer(model.hypernet, config.hypernet_optimizer)
 
     
-    # we use steps for scheduler to make it smoother, particularly for the short warmup stage
+    # we use steps instead of epochs for scheduler to make it smoother,
+    # particularly for the short warmup stage
     steps_per_epoch = len(trainloader)
     # generate schedulers as a dict with keys "predictor" and "hypernet"
     scheduler = build_hypernet_schedulers(config, optimizer, steps_per_epoch)

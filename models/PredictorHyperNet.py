@@ -14,7 +14,7 @@ class PredictorHyperNet(nn.Module):
         self.hypernet = HyperResNet20(num_classes)
 
         # iterations for curriculum
-        self.iter = 0
+        self.h_iter = 0
         self.p_iter = 0
 
         # Dropout
@@ -26,7 +26,7 @@ class PredictorHyperNet(nn.Module):
 
     # =====================================================
     def get_dropout_rate(self):
-        p = min(1.0, self.iter / self.warmup_dropout)
+        p = min(1.0, self.h_iter / self.warmup_dropout)
         hypernet_dropout = self.max_dropout * p
 
         p = min(1.0, self.p_iter / self.warmup_dropout)
@@ -39,40 +39,25 @@ class PredictorHyperNet(nn.Module):
         if x_prior is None:
             x_prior = x
 
-        # Local flags (avoid mutating state)
-        no_prior = self.no_prior
-        zero_input = self.zero_input
-
-        if no_prior:
-            zero_input = False
-        elif zero_input:
-            no_prior = False
-
         h_dropout, p_dropout = self.get_dropout_rate()
 
         # -------------------------
         # Predictor branch
         # -------------------------
-        if no_prior:
-            prior = torch.zeros(x.size(0), self.num_classes, device=x.device)
-            prior_hyper = prior
-        else:
-            prior = self.predictor(x_prior, dropout = p_dropout)
-            prior_hyper = prior.detach()
+        prior = self.predictor(x_prior, dropout = p_dropout)
+        prior_hyper = prior.detach()
 
-            if self.training:
-                self.p_iter += 1
+        if self.training:
+            self.p_iter += 1
 
         # -------------------------
         # HyperNet branch
         # -------------------------
-        if zero_input:
-            x = torch.zeros_like(x)
 
-        out = self.hypernet(x, prior_hyper, iter=self.iter, dropout = h_dropout)
+        out = self.hypernet(x, prior_hyper, iter=self.h_iter, dropout = h_dropout)
 
         if self.training:
-            self.iter += 1
+            self.h_iter += 1
 
         return out, prior
     
